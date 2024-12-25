@@ -5,7 +5,6 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
 import torch
-import torch.nn as nn
 from pathlib import Path
 from transformers import AutoTokenizer
 from tqdm import tqdm
