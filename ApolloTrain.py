@@ -1,18 +1,21 @@
-from Models.VideoAutoEncoder import EfficientVideoAutoencoder, save_video_tensor
-from Models.Model.PrometheusModel import Prometheus
+from VideoAutoencoder import AdaptiveEfficientVideoAutoencoder, save_video_tensor
+from PrometheusCore import Prometheus
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import GradScaler, autocast
 import torch
+import torch.nn as nn
+from pathlib import Path
+from transformers import AutoTokenizer
+from tqdm import tqdm
 import numpy as np
 import torch.nn.functional as F
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
-from tqdm import tqdm
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
 import torchmetrics.functional as metrics
-from itertools import cycle
-from datasets import load_dataset
 
 def collate_fn(batch):
     """Solo toma los videos del batch, ignorando el texto"""
@@ -33,7 +36,7 @@ class VideoProcessor:
         Input/Output: tensor de forma [C, T, H, W]
         """
         # Print shape for debugging
-        print(f"Input video shape: {video.shape}")
+        #print(f"Input video shape: {video.shape}")
         
         # Ensure correct temporal dimension
         if video.shape[1] != self.num_frames:
@@ -59,7 +62,7 @@ class VideoProcessor:
         video = (video * 2) - 1
         
         # Print final shape for verification
-        print(f"Output video shape: {video.shape}")
+        #print(f"Output video shape: {video.shape}")
         
         return video
 
@@ -87,6 +90,8 @@ class VideoDataset(Dataset):
         self.video_folder = Path(video_folder)
         self.processor = processor
         self.data = pd.read_csv(csv_path)
+        self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        self.max_length = 1024
         # Verificar existencia de archivos
         self.data = self.data[self.data.apply(
             lambda x: (self.video_folder / f"{x['video_name']}.mp4").exists(), 
@@ -100,63 +105,65 @@ class VideoDataset(Dataset):
     def load_video(self, video_path):
         try:
             import av
-            container = av.open(str(video_path))
-            stream = container.streams.video[0]
+            with av.open(str(video_path)) as container:  # Usar context manager
+                stream = container.streams.video[0]
             
-            # Obtener todos los frames primero
-            frames = []
-            for frame in container.decode(video=0):
-                frames.append(frame)
+            # Contar frames primero sin guardarlos
+                total_frames = stream.frames
+                if total_frames == 0:
+                # Si no podemos obtener el conteo directamente, contamos manualmente
+                    total_frames = sum(1 for _ in container.decode(video=0))
+                    container.seek(0)  # Regresar al inicio
             
-            total_frames = len(frames)
-            if total_frames == 0:
-                raise ValueError("No frames found in video")
+
+                if total_frames == 0:
+                    raise ValueError("No frames found in video")
                 
             # Calcular índices para muestreo uniforme
-            if total_frames >= self.processor.num_frames:
-                indices = np.linspace(0, total_frames-1, self.processor.num_frames, dtype=int)
-            else:
-                indices = np.arange(total_frames)
-                
-            # Crear tensor de salida
-            video_tensor = torch.zeros(3, self.processor.num_frames, *self.processor.target_size)
-            
-            # Procesar frames seleccionados
-            for i, idx in enumerate(indices):
-                if i >= self.processor.num_frames:
-                    break
-                    
-                if idx >= len(frames):
-                    # Usar último frame si nos pasamos
-                    img = frames[-1].to_ndarray(format='rgb24')
+                if total_frames >= self.processor.num_frames:
+                    indices = np.linspace(0, total_frames-1, self.processor.num_frames, dtype=int)
                 else:
-                    img = frames[idx].to_ndarray(format='rgb24')
+                    indices = np.arange(total_frames)
+            
+            # Crear tensor de salida
+                video_tensor = torch.zeros(3, self.processor.num_frames, *self.processor.target_size)
+            
+            # Procesar frames uno por uno
+                current_frame = 0
+                for i, frame in enumerate(container.decode(video=0)):
+                    if i not in indices:
+                        continue
+                    
+                # Procesar solo los frames que necesitamos
+                    output_idx = np.where(indices == i)[0][0]
+                    if output_idx >= self.processor.num_frames:
+                        break
                 
-                # Convertir a tensor y normalizar
-                img = torch.from_numpy(img).float() / 255.0
+                # Convertir frame a tensor directamente
+                    img = frame.to_ndarray(format='rgb24')
+                    img = torch.from_numpy(img).float() / 255.0
                 
                 # Redimensionar si es necesario
-                if img.shape[0:2] != self.processor.target_size:
-                    img = F.interpolate(
-                        img.permute(2, 0, 1).unsqueeze(0),
-                        size=self.processor.target_size,
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(0)
-                else:
-                    img = img.permute(2, 0, 1)
+                    if img.shape[0:2] != self.processor.target_size:
+                        img = F.interpolate(
+                            img.permute(2, 0, 1).unsqueeze(0),
+                            size=self.processor.target_size,
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze(0)
+                    else:
+                        img = img.permute(2, 0, 1)
                 
-                video_tensor[:, i] = img
+                    video_tensor[:, output_idx] = img
+                    current_frame = output_idx
             
             # Si faltan frames, repetir el último
-            if len(indices) < self.processor.num_frames:
-                video_tensor[:, len(indices):] = video_tensor[:, -1].unsqueeze(1).expand(-1, self.processor.num_frames - len(indices), -1, -1)
+                if current_frame + 1 < self.processor.num_frames:
+                    video_tensor[:, current_frame+1:] = video_tensor[:, current_frame].unsqueeze(1).expand(
+                        -1, self.processor.num_frames - (current_frame + 1), -1, -1
+                    )
             
-            # Liberar memoria
-            del frames
-            container.close()
-            
-            return self.processor.transform(video_tensor)
+                return self.processor.transform(video_tensor)
             
         except Exception as e:
             print(f"Error cargando video {video_path}: {str(e)}")
@@ -170,58 +177,52 @@ class VideoDataset(Dataset):
         
         # Procesar texto
         text = row['answer']
-        text_encoded = np.frombuffer(text.encode('utf-8'), dtype=np.uint8)
-        text_tensor = torch.tensor(text_encoded, dtype=torch.long)
+        text_encoded = self.tokenizer.encode(
+            text,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        text_tensor = text_encoded.squeeze(0)
         
         return text_tensor, video_tensor
 
-class TextDataset(Dataset):
-    def __init__(self, data, seq_len):
-        super().__init__()
-        self.seq_len = seq_len
-        self.data = []
-        for item in data:
-            text = item['text']
-            if not isinstance(text, str):
-                text = str(text)
-            bytes_array = np.frombuffer(text.encode('utf-8'), dtype=np.uint8)
-            self.data.extend(bytes_array)
-        self.data = torch.tensor(self.data, dtype=torch.long)
-        self.data_length = len(self.data)
-
-    def __len__(self):
-        return self.data_length // self.seq_len
-
-    def __getitem__(self, index):
-        rand_start = torch.randint(0, self.data_length - self.seq_len - 1, (1,))
-        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq
-
-def TrainAutoEncoder():
+def TrainAutoEncoderAdapt240p():
+    """
+    Entrena el AutoEncoder adaptativo específicamente para videos de 240p y 10 segundos
+    """
     # Configuración
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 1
-    num_epochs = 100
-    save_every = 500  # Guardar cada N pasos
+    batch_size = 2
+    num_epochs = 1
+    save_every = 50
+    
+    # Configuración específica para 240p
+    resolution = (240, 426)
+    fps = 15
+    duration = 10
     
     # Setup directorios
-    results_folder = Path('./results')
+    results_folder = Path('./results_adaptive_240p')
     results_folder.mkdir(exist_ok=True, parents=True)
     
-    # Dataset y modelo
-    processor = VideoProcessor(target_size=(240, 426))  # Ajustado para 240p
+    # Inicializar procesador
+    processor = VideoProcessor(
+        target_size=resolution,
+        fps=fps,
+        duration=duration
+    )
+    
+    # Dataset
     dataset = VideoDataset(
         csv_path="/teamspace/studios/this_studio/datos_videos.csv",
         video_folder="/teamspace/studios/this_studio/VideoDetailCaption/Test_Videos/",
         processor=processor
     )
     
-    # Modificar el __getitem__ para solo retornar el video
-    original_getitem = dataset.__getitem__
-    dataset.__getitem__ = lambda idx: original_getitem(idx)[1]
-    
     dataloader = DataLoader(
-        dataset, 
+        dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=4,
@@ -230,8 +231,157 @@ def TrainAutoEncoder():
         collate_fn=collate_fn
     )
     
-    # Modelo y optimizador
-    model = EfficientVideoAutoencoder(dim_latent=128).to(device)
+    # Modelo y optimizador - Asegurando que todo esté en float32 inicialmente
+    model = AdaptiveEfficientVideoAutoencoder(dim_latent=128, duration=10, quality='240p').to(device)
+    model.print_model_info()
+    optimizer = AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+    scheduler = CosineAnnealingLR(optimizer, T_max=len(dataloader) * num_epochs)
+    scaler = GradScaler()
+    
+    # Variables de tracking
+    best_loss = float('inf')
+    global_step = 0
+    
+    # Training loop
+    for epoch in range(num_epochs):
+        model.train()
+        pbar = tqdm(dataloader, desc=f'Epoch {epoch} | 240p Training')
+        
+        for videos in pbar:
+            try:
+                # Procesar videos y moverlos a GPU en float32
+                videos = processor.process_batch(videos)
+                videos = videos.to(device, dtype=torch.float32)
+                
+                optimizer.zero_grad(set_to_none=True)
+                
+                # Usar autocast para precisión mixta
+                with autocast():
+                    reconstructed = model(videos)
+                    assert reconstructed.shape == videos.shape, \
+                        f"Shape mismatch: reconstructed {reconstructed.shape} vs input {videos.shape}"
+                    
+                    # Pérdida combinada
+                    recon_loss = F.l1_loss(reconstructed, videos)
+                    ssim_loss = 1 - metrics.structural_similarity_index_measure(
+                        reconstructed,
+                        videos,
+                        data_range=2.0
+                    )
+                    loss = 0.7 * recon_loss + 0.3 * ssim_loss
+                
+                # Backward y optimize con scaler
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                
+                # Logging
+                pbar.set_description(
+                    f'Epoch {epoch} | 240p | Loss: {loss.item():.4f} | '
+                    f'Recon: {recon_loss.item():.4f} | SSIM: {ssim_loss.item():.4f}'
+                )
+                
+                # Guardar checkpoints y muestras
+                if global_step % save_every == 0:
+                    if loss.item() < best_loss:
+                        best_loss = loss.item()
+                        torch.save({
+                            'epoch': epoch,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'loss': best_loss,
+                        }, results_folder / 'best_model_240p.pt')
+                    
+                    with torch.no_grad():
+                        save_video_tensor(
+                            reconstructed[0],
+                            results_folder / f'recon_video_240p_{global_step}.mp4',
+                            fps=processor.fps
+                        )
+                
+                global_step += 1
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    torch.cuda.empty_cache()
+                    print("\nOOM Error, skipping batch")
+                    continue
+                raise e
+
+def TrainApolloVideo():
+    """ Entrena el modelo Apollo para generar videos """
+    # Configuración
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch_size = 2
+    num_epochs = 100
+    save_every = 10
+    
+    # Configuración específica para 240p
+    resolution = (240, 426)
+    fps = 15
+    duration = 10
+    
+    # Setup directorios
+    results_folder = Path('./results_prometheus')
+    results_folder.mkdir(exist_ok=True, parents=True)
+    
+    # Inicializar procesador
+    processor = VideoProcessor(
+        target_size=resolution,
+        fps=fps,
+        duration=duration
+    )
+    
+    # Dataset
+    dataset = VideoDataset(
+        csv_path="/teamspace/studios/this_studio/datos_videos.csv",
+        video_folder="/teamspace/studios/this_studio/VideoDetailCaption/Test_Videos/",
+        processor=processor
+    )
+    
+    # Crear dataloader sin collate_fn personalizado para mantener texto y video
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2
+    )
+    
+    # Cargar AutoEncoder pre-entrenado
+    video_autoencoder = AdaptiveEfficientVideoAutoencoder(
+        dim_latent=128,
+        duration=duration,
+        quality='240p'
+    ).to(device)
+    
+    # Cargar checkpoint
+    autoencoder_checkpoint = torch.load('./results_adaptive_240p/best_model_240p.pt')
+    video_autoencoder.load_state_dict(autoencoder_checkpoint['model_state_dict'])
+    print("AutoEncoder cargado exitosamente")
+    
+    # Inicializar Prometheus
+    model = Prometheus(
+        num_text_tokens=50257,  # Tamaño del vocabulario de GPT2
+        transformer=dict(
+            dim=768,
+            depth=12,
+            heads=12,
+            dim_head=64
+        ),
+        modality_encoder=video_autoencoder,
+        dim_latent=128,
+        modality_num_dim=3,  # Para video (tiempo, altura, ancho)
+        modality_default_shape=(150, 240, 426),  # Para 240p @ 15fps por 10s
+        channel_first_latent=True,
+        add_pos_emb=True
+    ).to(device)
+    
+    # Optimizador y scheduler
     optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     scheduler = CosineAnnealingLR(optimizer, T_max=len(dataloader) * num_epochs)
     scaler = GradScaler()
@@ -243,31 +393,35 @@ def TrainAutoEncoder():
     # Training loop
     for epoch in range(num_epochs):
         model.train()
-        pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
+        pbar = tqdm(dataloader, desc=f'Epoch {epoch} | Prometheus Training')
         
-        for videos in pbar:
+        for batch in pbar:
             try:
-                videos = processor.process_batch(videos)
-                print(f"Batch shape after processing: {videos.shape}")
-                videos = videos.to(device)
+                text_tensors, video_tensors = batch
+                
+                # Mover a GPU
+                text_tensors = text_tensors.to(device)
+                video_tensors = video_tensors.to(device)
+                
+                # Preparar formato de entrada para Prometheus
+                # Cada muestra debe ser [text_tensor, (0, video_tensor)]
+                batch_samples = []
+                for text, video in zip(text_tensors, video_tensors):
+                    batch_samples.append([
+                        text,
+                        (0, video)  # 0 indica el primer tipo de modalidad
+                    ])
+                
                 optimizer.zero_grad(set_to_none=True)
                 
+                # Forward pass con precisión mixta
                 with autocast():
-                    reconstructed = model(videos)
-                    print(f"Reconstructed shape: {reconstructed.shape}")
-                    assert reconstructed.shape == videos.shape, \
-                        f"Shape mismatch: reconstructed {reconstructed.shape} vs input {videos.shape}"
-                    
-                    # Pérdida combinada
-                    recon_loss = F.l1_loss(reconstructed, videos)
-                    ssim_loss = 1 - metrics.structural_similarity_index_measure(
-                        reconstructed, 
-                        videos,
-                        data_range=2.0
+                    loss = model(
+                        batch_samples,
+                        return_loss=True
                     )
-                    loss = 0.7 * recon_loss + 0.3 * ssim_loss
                 
-                # Backward y optimize
+                # Backward y optimize con scaler
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -277,13 +431,11 @@ def TrainAutoEncoder():
                 
                 # Logging
                 pbar.set_description(
-                    f'Epoch {epoch} | Loss: {loss.item():.4f} | '
-                    f'Recon: {recon_loss.item():.4f} | SSIM: {ssim_loss.item():.4f}'
+                    f'Epoch {epoch} | Loss: {loss.item():.4f}'
                 )
                 
-                # Guardar checkpoints y muestras
+                # Guardar checkpoints
                 if global_step % save_every == 0:
-                    # Guardar si es el mejor modelo
                     if loss.item() < best_loss:
                         best_loss = loss.item()
                         torch.save({
@@ -293,13 +445,13 @@ def TrainAutoEncoder():
                             'loss': best_loss,
                         }, results_folder / 'best_model.pt')
                     
-                    # Guardar muestra de reconstrucción
-                    with torch.no_grad():                        
-                        save_video_tensor(
-                            reconstructed[0],
-                            results_folder / f'recon_video_{global_step}.mp4',
-                            fps=processor.fps
-                        )
+                    # Checkpoint regular
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss': loss.item(),
+                    }, results_folder / f'checkpoint_{global_step}.pt')
                 
                 global_step += 1
                 
@@ -310,296 +462,8 @@ def TrainAutoEncoder():
                     continue
                 raise e
 
-def TrainModelApolloVideo():
-    # Configuración
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 1
-    num_epochs = 50
-    save_every = 200
-    dim_latent = 128
-
-    # Directorios
-    results_folder = Path('./results')
-    results_folder.mkdir(exist_ok=True, parents=True)
-
-    # Cargar el autoencoder pre-entrenado
-    VideoAutoEncoder = EfficientVideoAutoencoder(dim_latent=dim_latent).to(device)
-    autoencoder_checkpoint = torch.load(results_folder / 'best_model.pt')
-    VideoAutoEncoder.load_state_dict(autoencoder_checkpoint['model_state_dict'])
-    VideoAutoEncoder.eval()
-
-    # Configurar el procesador y dataset
-    processor = VideoProcessor(target_size=(240, 426))  # Mantenemos la resolución original
-    dataset = VideoDataset(
-        csv_path="/teamspace/studios/this_studio/datos_videos.csv",
-        video_folder="/teamspace/studios/this_studio/VideoDetailCaption/Test_Videos/",
-        processor=processor
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2
-    )
-
-
-    model = Prometheus(
-        num_text_tokens=1024,
-        dim_latent=dim_latent,
-        modality_default_shape=(30, 30, 53),  # Ajustado para 240x426 después del encoding
-        modality_encoder=VideoAutoEncoder.encoder_blocks,
-        modality_decoder=VideoAutoEncoder.decoder_blocks,
-        add_pos_emb=True,
-        modality_num_dim=3, # 3 dimensiones para video
-        transformer=dict(
-            dim=768,
-            depth=12,
-            dim_head=12,
-            heads=12,
-        )
-    ).to(device)
-
-    # Optimizador y schedulers con ajustes para el modelo más grande
-    optimizer = AdamW(
-        model.parameters_without_encoder_decoder(), 
-        lr=5e-5,  # Reducida para modelo más grande
-        weight_decay=0.1,  # Aumentado para mejor regularización
-        betas=(0.9, 0.999)
-    )
-    
-    scheduler = CosineAnnealingLR(
-        optimizer, 
-        T_max=len(dataloader) * num_epochs,
-        eta_min=1e-6  # Valor mínimo de learning rate
-    )
-    
-    scaler = GradScaler()
-
-    # Variables de tracking
-    best_loss = float('inf')
-    global_step = 0
-
-    # Training loop
-    for epoch in range(num_epochs):
-        model.train()
-        pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
-
-        for text, videos in pbar:
-            try:
-                # Procesar batch
-                videos = processor.process_batch(videos).to(device)
-                text = text.to(device)
-
-                optimizer.zero_grad(set_to_none=True)
-
-                with autocast():
-                    # Forward pass
-                    loss = model((text, videos))
-
-                # Backward y optimize con gradient clipping más conservador
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-
-                # Logging más detallado
-                if global_step % 10 == 0:  # Cada 10 pasos
-                    lr = optimizer.param_groups[0]['lr']
-                    pbar.set_description(
-                        f'Epoch {epoch} | Loss: {loss.item():.4f} | LR: {lr:.2e}'
-                    )
-
-                # Guardar checkpoints y muestras
-                if global_step % save_every == 0:
-                    if loss.item() < best_loss:
-                        best_loss = loss.item()
-                        torch.save({
-                            'epoch': epoch,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': scheduler.state_dict(),
-                            'loss': best_loss,
-                            'global_step': global_step
-                        }, results_folder / 'best_model_apollo_video.pt')
-
-                    # Generar y guardar una muestra
-                    with torch.no_grad():
-                        sample_text = text[0:1]
-                        generated_video = model.generate(sample_text)
-                        save_video_tensor(
-                            generated_video[0],
-                            results_folder / f'generated_video_{global_step}.mp4',
-                            fps=processor.fps
-                        )
-
-                global_step += 1
-
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    torch.cuda.empty_cache()
-                    print("\nOOM Error, skipping batch")
-                    continue
-                raise e
-
-        # Guardar checkpoint por época
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'loss': best_loss,
-            'global_step': global_step
-        }, results_folder / f'checkpoint_apollo_video_epoch_{epoch}.pt')
-
-
-def TrainModelApolloText():
-    # Configuración
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 32  # Podemos usar batch más grande para texto
-    text_seq_len = 256
-    num_epochs = 50
-    save_every = 500
-    dim_latent = 128
-    VideoAutoEncoder = EfficientVideoAutoencoder(dim_latent=dim_latent).to(device)
-    # Directorios
-    results_folder = Path('./results')
-    results_folder.mkdir(exist_ok=True, parents=True)
-
-    # Cargar el último checkpoint del entrenamiento de video
-    model = Prometheus(
-        num_text_tokens=1024,
-        dim_latent=128,
-        modality_default_shape=(30, 30, 53),  # Mantenemos la configuración de video
-        modality_encoder=VideoAutoEncoder.encoder_blocks,
-        modality_decoder=VideoAutoEncoder.decoder_blocks,
-        add_pos_emb=True,
-        modality_num_dim=3,
-        transformer=dict(
-            dim=768,
-            depth=12,
-            dim_head=12,
-            heads=12,
-        )
-    ).to(device)
-
-    # Cargar checkpoint de video
-    checkpoint = torch.load(results_folder / 'best_model_apollo_video.pt')
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"Modelo cargado desde época {checkpoint['epoch']} con pérdida {checkpoint['loss']}")
-
-    # Dataset de texto
-    text_dataset = load_dataset("stas/openwebtext-10k")
-    train_dataset = TextDataset(text_dataset['train'], text_seq_len)
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    train_iter = cycle(train_loader)
-
-    # Optimizador y scheduler
-    optimizer = AdamW(
-        model.parameters(), 
-        lr=1e-4,
-        weight_decay=0.1,
-        betas=(0.9, 0.999)
-    )
-    
-    scheduler = CosineAnnealingLR(
-        optimizer, 
-        T_max=num_epochs * len(train_loader),
-        eta_min=1e-6
-    )
-    
-    scaler = GradScaler()
-
-    # Variables de tracking
-    best_loss = float('inf')
-    global_step = 0
-
-    # Training loop
-    total_steps = num_epochs * len(train_loader)
-    with tqdm(total=total_steps) as pbar:
-        for epoch in range(num_epochs):
-            for step in range(len(train_loader)):
-                try:
-                    model.train()
-                    data = next(train_iter).to(device)
-
-                    optimizer.zero_grad(set_to_none=True)
-
-                    with autocast():
-                        loss = model(data)
-
-                    # Backward y optimize
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-
-                    # Logging
-                    lr = optimizer.param_groups[0]['lr']
-                    pbar.set_description(
-                        f'Epoch {epoch} | Step {step} | Loss: {loss.item():.4f} | LR: {lr:.2e}'
-                    )
-                    pbar.update()
-
-                    # Guardar checkpoints
-                    if global_step % save_every == 0:
-                        if loss.item() < best_loss:
-                            best_loss = loss.item()
-                            torch.save({
-                                'epoch': epoch,
-                                'step': step,
-                                'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'scheduler_state_dict': scheduler.state_dict(),
-                                'loss': best_loss,
-                                'global_step': global_step
-                            }, results_folder / 'best_model_apollo_text.pt')
-
-                    global_step += 1
-
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        torch.cuda.empty_cache()
-                        print("\nOOM Error, skipping batch")
-                        continue
-                    raise e
-
-            # Guardar checkpoint por época
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': best_loss,
-                'global_step': global_step
-            }, results_folder / f'checkpoint_apollo_text_epoch_{epoch}.pt')
-
-    # Guardar modelo final
-    torch.save({
-        'epoch': num_epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'loss': best_loss,
-        'global_step': global_step
-    }, results_folder / 'final_model_apollo_text.pt')
-
-if __name__ == "__main__":
-    print("Training Video Autoencoder")
-    TrainAutoEncoder()
-    print("Training Apollo Video Model")
-    TrainModelApolloVideo()
-    print("Training Apollo Text Model")
-    TrainModelApolloText()
+if __name__ == '__main__':
+    print("Training AutoEncoder 240p 10s")
+    TrainAutoEncoderAdapt240p()
+    print("Training Prometheus with Video")
+    TrainApolloVideo()
