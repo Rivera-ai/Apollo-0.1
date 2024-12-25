@@ -1,6 +1,5 @@
 from VideoAutoencoder import AdaptiveEfficientVideoAutoencoder, save_video_tensor
 from PrometheusCore import Prometheus
-from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
@@ -10,10 +9,8 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 import numpy as np
 import torch.nn.functional as F
-from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
-from torch.cuda.amp import GradScaler, autocast
 import torchmetrics.functional as metrics
 
 def collate_fn(batch):
